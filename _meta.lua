@@ -18,5 +18,5 @@ return {
     description = _([[
 Sends reading progress, session history, book status, ratings and reviews to Storylines.
 
-Pair once with a code from the app; after that it syncs on its own when you close a book or the device sleeps.]]),
+Pair once with a code from the app; after that it syncs on its own when you close a book, when the network reconnects, and as you read.]]),
 }

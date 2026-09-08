@@ -57,7 +57,8 @@ network to sync without you connecting by hand each time.
 
 ## When it syncs
 
-On closing a book, on the device going to sleep, when the network comes back, and every
+On closing a book, shortly afterwards to catch the sitting that just ended, when the
+network comes back, and every
 50 page turns. **Tools → Storylines sync → Sync now** forces it, and **Sync
 automatically** turns the rest off if you'd rather it only ran when you ask.
 

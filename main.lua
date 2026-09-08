@@ -52,8 +52,11 @@ local ENDPOINT = "https://storylines.software/sync"
 -- you are in the middle of right now is never sent, because nothing follows it.
 local SESSION_GAP_SECONDS = 600
 
--- Matches the server's own caps, so a batch is never refused for size.
+-- Match the server's own caps, so a batch is never refused for size. Sessions
+-- need this as much as documents do: one widened query can fold several
+-- thousand sittings out of a long history.
 local MAX_DOCUMENTS_PER_PUSH = 500
+local MAX_SESSIONS_PER_PUSH = 2000
 
 -- Row limits, not session limits: `page_stat_data` holds one row per page turn,
 -- and a session is many rows.
@@ -72,8 +75,8 @@ local DEFAULT_PAGES_BEFORE_SYNC = 50
 -- user is not expecting to wait — closing a book, reconnecting — so it gets
 -- short timeouts and a hard cap on round trips. An interactive one is behind a
 -- menu tap, where waiting is understood, and is allowed to drain a backlog.
-local AUTOMATIC = { connect = 5, total = 15, batches = 2 }
-local INTERACTIVE = { connect = 10, total = 30, batches = 20 }
+local AUTOMATIC = { block = 5, total = 15, batches = 2 }
+local INTERACTIVE = { block = 10, total = 30, batches = 20 }
 
 -- KOReader's statistics table predates the plugin and is read-only here. We
 -- never write to it.
@@ -104,7 +107,6 @@ function Storylines:init()
     self:loadSettings()
     self.last_page_synced = nil
     self.page_update_counter = 0
-    self.syncing = false
 
     if self.ui and self.ui.menu then
         self.ui.menu:registerToMainMenu(self)
@@ -119,10 +121,22 @@ end
 --- eventually fires it writes settings from an instance that no longer reflects
 --- what the surviving one did.
 function Storylines:onCloseWidget()
-    if self.deferred_sync then
-        UIManager:unschedule(self.deferred_sync)
-        self.deferred_sync = nil
+    for _index, scheduled in ipairs(self.scheduled or {}) do
+        UIManager:unschedule(scheduled)
     end
+    self.scheduled = nil
+    self.deferred_sync = nil
+end
+
+--- Schedules work and remembers it, so `onCloseWidget` can cancel it.
+---
+--- Anything scheduled anonymously outlives this instance: the closure pins the
+--- reader and its document in memory, and then runs against an object that no
+--- longer reflects what the surviving instance did.
+function Storylines:scheduleTracked(seconds, action)
+    self.scheduled = self.scheduled or {}
+    self.scheduled[#self.scheduled + 1] = action
+    UIManager:scheduleIn(seconds, action)
 end
 
 function Storylines:onDispatcherRegisterActions()
@@ -373,8 +387,16 @@ function Storylines:request(method, path, body_table, profile, anonymous)
         headers["Authorization"] = "Bearer " .. token
     end
 
+    -- `socketutil.table_sink`, not `ltn12.sink.table`. LuaSocket resets its
+    -- timeout between polls, so the *total* timeout is only ever enforced by
+    -- socketutil's own sinks — with a plain ltn12 sink a slow-drip response
+    -- can hold the UI thread far past `profile.total`, which is the whole
+    -- point of having a short automatic profile.
     local sink = {}
-    socketutil:set_timeout(profile.connect, profile.total)
+    local collector = socketutil.table_sink and socketutil.table_sink(sink) or ltn12.sink.table(sink)
+
+    -- First argument is LuaSocket's per-block timeout, second the total.
+    socketutil:set_timeout(profile.block, profile.total)
     -- `socket.http` handles https here: KOReader's socketutil requires
     -- `ssl.https` unconditionally at load, so a build without LuaSec could not
     -- run this plugin at all.
@@ -383,7 +405,7 @@ function Storylines:request(method, path, body_table, profile, anonymous)
         method = method,
         headers = headers,
         source = body_json and ltn12.source.string(body_json) or nil,
-        sink = ltn12.sink.table(sink),
+        sink = collector,
     }
     socketutil:reset_timeout()
 
@@ -665,6 +687,11 @@ function Storylines:collectSessions(since)
     for step, limit in ipairs(ROW_LIMIT_STEPS) do
         local sessions, watermark, truncated = self:querySessions(since, limit)
 
+        -- nil means the database could not be read. Propagated rather than
+        -- flattened to an empty list, so the caller can tell a failure from a
+        -- device with no history.
+        if sessions == nil then return nil, nil end
+
         -- Something to send, or the query reached the end of the history:
         -- either way this is the answer.
         if #sessions > 0 or not truncated then
@@ -728,9 +755,15 @@ function Storylines:querySessions(since, limit)
 
         local open = {}
 
-        --- `open_at_end` marks a session that was force-closed because the rows
-        --- ran out rather than because a gap ended it — so it may continue in
-        --- rows this query did not reach.
+        --- `open_at_end` marks a session that unread rows could still extend.
+        ---
+        --- Not simply "was still open when the rows ran out". `open` holds only
+        --- the latest session per book — a gap-closed one is replaced, never
+        --- deleted — so at the end of the window *every* book that appears
+        --- anywhere in it has a session sitting in `open`, whether or not the
+        --- row limit cut anything of its. Flagging all of them collapsed the
+        --- boundary onto the oldest session in the window and froze the
+        --- watermark for good.
         local function close_session(entry, open_at_end)
             local count = 0
             for _page in pairs(entry.pages_seen) do count = count + 1 end
@@ -773,6 +806,10 @@ function Storylines:querySessions(since, limit)
 
             entry.duration = entry.duration + duration
             entry.ends_at = start_time + duration
+            -- The last row's own start, which is what the watermark is
+            -- compared against — `ends_at` includes the reading time and would
+            -- overshoot.
+            entry.last_start = start_time
             -- The page count in force at the end of the sitting: if the font
             -- changed mid-session, the later value matches the pages actually
             -- turned.
@@ -780,14 +817,22 @@ function Storylines:querySessions(since, limit)
             entry.pages_seen[page] = true
         end
 
+        -- Unread rows all start at or after the last row this query read, so a
+        -- session can only be extended by one if its own end is within a gap of
+        -- that point. Anything that finished earlier is complete, however the
+        -- query was cut.
         for _md5, entry in pairs(open) do
-            close_session(entry, true)
+            close_session(entry, (last_row_start - entry.ends_at) <= SESSION_GAP_SECONDS)
         end
     end)
 
     if not ok then
+        -- nil, not an empty list. A database that cannot be read is not a
+        -- device with nothing to say, and reporting "Synced 0 sessions" for a
+        -- corrupt statistics file is the same silent-success shape that hid
+        -- the plugin being a complete no-op.
         logger.warn("Storylines: could not read statistics:", tostring(err))
-        return {}, nil, false
+        return nil, nil, false
     end
 
     table.sort(sessions, function(a, b) return a.started_at < b.started_at end)
@@ -799,6 +844,7 @@ function Storylines:querySessions(since, limit)
     for _index, session in ipairs(sendable) do
         session.ends_at = nil
         session.open_at_end = nil
+        session.last_start = nil
     end
 
     return sendable, watermark, truncated
@@ -836,22 +882,68 @@ function Storylines:sessionPlan(sessions, truncated, last_row_start, since)
     local now = os.time()
     local boundary = nil
 
+    local function lower(candidate)
+        if not boundary or candidate < boundary then
+            boundary = candidate
+            return true
+        end
+        return false
+    end
+
     for _index, session in ipairs(sessions) do
         local settled = (now - session.ends_at) > SESSION_GAP_SECONDS
         local may_continue = session.open_at_end and truncated
 
         if not settled or may_continue then
-            if not boundary or session.started_at < boundary then
-                boundary = session.started_at
+            lower(session.started_at)
+        end
+    end
+
+    -- A session occupies a span, not an instant, so choosing by `started_at`
+    -- alone is not enough: the watermark re-reads every row from `boundary`
+    -- onwards, and a session that began before it but ran past it would have
+    -- its tail re-folded into a *new* session with a different `started_at` —
+    -- a duplicate the server cannot collapse, with its time counted twice.
+    --
+    -- Withholding such a session lowers the boundary, which can bring another
+    -- one into the same situation, so this settles to a fixed point. It
+    -- terminates because the boundary only ever decreases and is bounded below
+    -- by the earliest session in the batch.
+    local function settleCrossings()
+        local changed = true
+        while changed do
+            changed = false
+            for _index, session in ipairs(sessions) do
+                if boundary and session.started_at < boundary and session.last_start >= boundary then
+                    if lower(session.started_at) then changed = true end
+                end
             end
         end
     end
 
-    local sendable = {}
-    for _index, session in ipairs(sessions) do
-        if not boundary or session.started_at < boundary then
-            sendable[#sendable + 1] = session
+    local function currentlySendable()
+        local out = {}
+        for _index, session in ipairs(sessions) do
+            if not boundary or session.started_at < boundary then
+                out[#out + 1] = session
+            end
         end
+        return out
+    end
+
+    settleCrossings()
+    local sendable = currentlySendable()
+
+    -- The server caps a push, and one widened query can fold thousands of
+    -- sittings. Trimming the list alone would be wrong — the watermark would
+    -- then advance past sessions that were never sent — so the batch is cut by
+    -- *lowering the boundary*, which keeps the watermark and the payload
+    -- describing the same point in time. Re-settling afterwards because a
+    -- lower boundary can create new crossings.
+    while #sendable > MAX_SESSIONS_PER_PUSH do
+        lower(sendable[MAX_SESSIONS_PER_PUSH + 1].started_at)
+        settleCrossings()
+        sendable = currentlySendable()
     end
 
     local watermark = boundary and (boundary - 1) or (last_row_start or since)
@@ -879,7 +971,10 @@ function Storylines:syncNow(interactive)
         return
     end
 
-    if self.syncing then return end
+    -- Class-level, like the settings: both the FileManager and the ReaderUI
+    -- instance exist at once, and two concurrent syncs would race the same
+    -- watermark.
+    if Storylines.syncing then return end
 
     local profile = interactive and INTERACTIVE or AUTOMATIC
 
@@ -891,12 +986,12 @@ function Storylines:syncNow(interactive)
         return
     end
 
-    self.syncing = true
+    Storylines.syncing = true
     self.page_update_counter = 0
 
     local ok, err = pcall(function() self:performSync(interactive, profile) end)
 
-    self.syncing = false
+    Storylines.syncing = false
 
     if not ok then
         logger.warn("Storylines: sync failed:", tostring(err))
@@ -962,6 +1057,13 @@ function Storylines:performSync(interactive, profile)
             local since = self.settings:readSetting("last_session_start") or 0
             local sessions, watermark = self:collectSessions(since)
 
+            -- Unreadable statistics database. Reported as a failure so the
+            -- user isn't told the sync succeeded with nothing to send.
+            if sessions == nil then
+                failed = true
+                break
+            end
+
             -- Nothing to send does not always mean nothing to do: a window
             -- holding only unfinished sittings still moves the watermark up to
             -- just below the earliest of them, so the settled history before
@@ -1019,12 +1121,34 @@ function Storylines:onCloseDocument()
     -- Bounded to two round trips with short timeouts, because this runs inline
     -- on the UI thread before the reader finishes closing.
     self:syncNow(false)
+
+    -- The sitting that just ended is by definition unsettled, so the sync above
+    -- deliberately withholds it. Every other trigger fires on *new* activity,
+    -- so without this a reader who finishes a book and doesn't open another
+    -- would never see that last sitting arrive.
+    --
+    -- Untracked on purpose: the reader widget closes moments after this, and
+    -- `onCloseWidget` cancelling it would cancel the entire point. Safe because
+    -- it captures no instance — the settings and the sync mutex are both
+    -- class-level.
+    UIManager:scheduleIn(SESSION_GAP_SECONDS + 60, Storylines.catchUpSync)
+end
+
+--- Delivers the final sitting once it has had time to settle.
+---
+--- A plain function, not a method: it must not hold a reference to the reader
+--- instance that scheduled it, since that instance is torn down seconds later.
+function Storylines.catchUpSync()
+    local worker = setmetatable({}, { __index = Storylines })
+    worker:loadSettings()
+    if not worker:isPaired() or not worker:autoSyncEnabled() then return end
+    worker:syncNow(false)
 end
 
 function Storylines:onNetworkConnected()
     if not self:autoSyncEnabled() then return end
     if not self:isPaired() then return end
-    UIManager:scheduleIn(1, function() self:syncNow(false) end)
+    self:scheduleTracked(1, function() self:syncNow(false) end)
 end
 
 -- Deliberately no onSuspend. `Device:_beforeSuspend` broadcasts it inline on the
@@ -1052,7 +1176,7 @@ function Storylines:onPageUpdate(pageno)
     -- outlive this instance.
     self.deferred_sync = self.deferred_sync or function() self:syncNow(false) end
     UIManager:unschedule(self.deferred_sync)
-    UIManager:scheduleIn(10, self.deferred_sync)
+    self:scheduleTracked(10, self.deferred_sync)
 end
 
 function Storylines:onFlushSettings()
