@@ -25,10 +25,12 @@ Sync is one-way: Storylines never writes back to your e-reader.
 
 ## Install
 
-**From the App Store plugin** — search for "Storylines" and install.
+**From Storefront** — open **Tools → Storefront**, search for "Storylines", install. Also
+works from the older App Store plugin.
 
-**By hand** — download this repository, unzip it, and copy the folder into KOReader's
-plugin directory as `storylines.koplugin`:
+**By hand** — download `storylines.koplugin.zip` from
+[Releases](https://github.com/joekw/storylines.koplugin/releases), unzip it, and copy the
+folder into KOReader's plugin directory:
 
 | Device | Path |
 |---|---|
