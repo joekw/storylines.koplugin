@@ -123,13 +123,19 @@ reg("lua-ljsqlite3/init", { open=function(_, mode)
       end
       local since = tonumber(sql:match("start_time > (%-?%d+)"))
       local limit = tonumber(sql:match("LIMIT (%d+)"))
+      -- Filter, then ORDER BY start_time, then LIMIT -- SQLite's order, which
+      -- decides *which* rows the limit cuts. Applying the limit in array order
+      -- instead would feed the plugin a sequence real SQLite cannot produce and
+      -- quietly stop the interleaved cases from testing interleaving.
       local sel = {}
       for _, r in ipairs(M.rows) do
-        if r[3] > since then
-          sel[#sel+1] = r
-          if #sel >= limit then break end
-        end
+        if r[3] > since then sel[#sel+1] = r end
       end
+      table.sort(sel, function(a, b)
+        if a[3] ~= b[3] then return a[3] < b[3] end
+        return tostring(a[1]) < tostring(b[1])
+      end)
+      while #sel > limit do table.remove(sel) end
       return columnise(sel, 5)
     end,
     close = function() end,

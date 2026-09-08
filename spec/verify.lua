@@ -164,6 +164,32 @@ results[#results+1] = run("history + sitting in progress", rows, 200000)
 results[#results+1] = run("single row", {{"G",1,400000,60,100}}, 9000000)
 results[#results+1] = run("empty history", {}, 9000000)
 
+-- More sittings in one window than a single push can carry, all overlapping in
+-- an unbroken chain. An earlier version capped the batch by lowering the
+-- boundary, and re-settling then dragged it back past the first session,
+-- emptying the batch and freezing the watermark while reporting success.
+-- Each sitting spans the starts of the several that follow it, so withholding
+-- any one of them cascades the boundary backwards through the whole run. Twenty
+-- books in rotation keeps each book's own sittings far enough apart not to
+-- merge, while every sitting still straddles its neighbours in time.
+rows = {}
+local books = {}
+for i = 1, 20 do books[i] = "R" .. i end
+for sitting = 0, 2599 do
+    local book = books[(sitting % #books) + 1]
+    local base = 500000 + sitting * 100
+    rows[#rows+1] = {book, sitting % 200, base, 120, 400}
+    rows[#rows+1] = {book, (sitting % 200) + 1, base + 500, 120, 400}
+end
+results[#results+1] = run("2600 straddling sittings (push cap)", rows, 9000000)
+
+-- One sitting longer than every bounded step, so only the unbounded pass can
+-- fold it. A ceiling here used to strand it and everything after it for good.
+rows = {}
+for i = 0, 33000 do rows[#rows+1] = {"MEGA", i % 500, 900000 + i * 30, 30, 500} end
+rows[#rows+1] = {"AFTER", 1, 900000 + 33001 * 30 + 100000, 60, 200}
+results[#results+1] = run("sitting beyond every bounded step", rows, 9000000 + 40000000)
+
 local all = true
 for _, ok in ipairs(results) do all = all and ok end
 print("\nALL PASS: " .. tostring(all))

@@ -64,9 +64,16 @@ local MAX_SESSIONS_PER_PUSH = 2000
 -- Escalating rather than fixed. A query that ends mid-sitting can send nothing
 -- (see `sessionPlan`), and if every sitting in the window is unfinished the
 -- watermark cannot move at all — so when that happens the query is simply
--- widened. A person cannot turn 32,000 pages without a ten-minute break, so the
--- last step always resolves in practice.
-local ROW_LIMIT_STEPS = { 2000, 8000, 32000 }
+-- widened.
+--
+-- The last step is unbounded on purpose. A ceiling here is not a safety valve,
+-- it is permanent data loss: for history that has already been written the
+-- shape never changes, so a window that cannot yield a sendable sitting at the
+-- ceiling will never yield one, and everything from there on is stranded
+-- however many times it retries. The common steps stay small because they are
+-- what runs on a book close; the unbounded pass is the one that guarantees
+-- progress.
+local ROW_LIMIT_STEPS = { 2000, 8000, 32000, math.maxinteger }
 
 -- Page turns before an automatic sync. Progress arrives in bursts anyway.
 local DEFAULT_PAGES_BEFORE_SYNC = 50
@@ -387,16 +394,20 @@ function Storylines:request(method, path, body_table, profile, anonymous)
         headers["Authorization"] = "Bearer " .. token
     end
 
-    -- `socketutil.table_sink`, not `ltn12.sink.table`. LuaSocket resets its
-    -- timeout between polls, so the *total* timeout is only ever enforced by
-    -- socketutil's own sinks — with a plain ltn12 sink a slow-drip response
-    -- can hold the UI thread far past `profile.total`, which is the whole
-    -- point of having a short automatic profile.
-    local sink = {}
-    local collector = socketutil.table_sink and socketutil.table_sink(sink) or ltn12.sink.table(sink)
-
+    -- Order matters, and getting it wrong is silent. `socketutil.table_sink`
+    -- reads `socketutil.total_timeout` when the sink is *constructed*, and
+    -- short-circuits to a plain `ltn12.sink.table` if it is still the default
+    -- -1 — which is exactly what `reset_timeout` restores. Build the sink first
+    -- and the total timeout is never enforced by anything, because LuaSocket
+    -- resets its own timeout between polls; a slow-drip response would then
+    -- hold the UI thread indefinitely, which is the whole point of having a
+    -- short automatic profile. Every KOReader caller sets the timeout first.
+    --
     -- First argument is LuaSocket's per-block timeout, second the total.
     socketutil:set_timeout(profile.block, profile.total)
+
+    local sink = {}
+    local collector = socketutil.table_sink and socketutil.table_sink(sink) or ltn12.sink.table(sink)
     -- `socket.http` handles https here: KOReader's socketutil requires
     -- `ssl.https` unconditionally at load, so a build without LuaSec could not
     -- run this plugin at all.
@@ -700,8 +711,12 @@ function Storylines:collectSessions(since)
 
         -- Nothing sendable *and* rows left unread: every sitting in the window
         -- is unfinished, so widening is the only way the watermark can move.
+        -- The final step reads without a limit, so this cannot be the reason it
+        -- ends — if it ever is, say so plainly rather than implying a retry
+        -- will help, because for already-written history it will not.
         if step == #ROW_LIMIT_STEPS then
-            logger.warn("Storylines: no complete sitting within", limit, "rows; will retry later")
+            logger.warn("Storylines: no sendable sitting even unbounded; history from",
+                        since, "onwards is stalled")
             return sessions, watermark
         end
     end
@@ -934,18 +949,15 @@ function Storylines:sessionPlan(sessions, truncated, last_row_start, since)
     settleCrossings()
     local sendable = currentlySendable()
 
-    -- The server caps a push, and one widened query can fold thousands of
-    -- sittings. Trimming the list alone would be wrong — the watermark would
-    -- then advance past sessions that were never sent — so the batch is cut by
-    -- *lowering the boundary*, which keeps the watermark and the payload
-    -- describing the same point in time. Re-settling afterwards because a
-    -- lower boundary can create new crossings.
-    while #sendable > MAX_SESSIONS_PER_PUSH do
-        lower(sendable[MAX_SESSIONS_PER_PUSH + 1].started_at)
-        settleCrossings()
-        sendable = currentlySendable()
-    end
-
+    -- Deliberately not capped here. Capping by lowering the boundary looked
+    -- tidy — watermark and payload stay in step — but with enough overlapping
+    -- sittings the re-settling drags the boundary back past the first session
+    -- and empties the batch, which freezes the watermark and reports success:
+    -- the exact failure this whole function exists to prevent.
+    --
+    -- Size is a transport concern, not a correctness one. `performSync` splits
+    -- the result across requests and only advances the watermark once every
+    -- one of them has landed, which keeps the two questions apart.
     local watermark = boundary and (boundary - 1) or (last_row_start or since)
     return math.max(watermark, since), sendable
 end
@@ -1073,17 +1085,34 @@ function Storylines:performSync(interactive, profile)
                 self:setSetting("last_session_start", watermark)
                 self.settings:flush()
             else
-                local response, status = self:request("POST", "/push", { sessions = sessions }, profile)
-                if status == 401 then
-                    self:handleRejectedToken()
-                    return
-                end
-                if status ~= 200 then
-                    failed = true
-                    break
+                -- Split for transport only. `sessionPlan` decided which
+                -- sittings are safe to send as one unit, so the watermark moves
+                -- only after every part of that unit has landed — a partial
+                -- push must be re-sent, and re-sending is harmless because the
+                -- keys are stable.
+                local rejected = false
+
+                for offset = 1, #sessions, MAX_SESSIONS_PER_PUSH do
+                    local chunk = {}
+                    for index = offset, math.min(offset + MAX_SESSIONS_PER_PUSH - 1, #sessions) do
+                        chunk[#chunk + 1] = sessions[index]
+                    end
+
+                    local response, status = self:request("POST", "/push", { sessions = chunk }, profile)
+                    if status == 401 then
+                        self:handleRejectedToken()
+                        return
+                    end
+                    if status ~= 200 then
+                        failed = true
+                        rejected = true
+                        break
+                    end
+
+                    pushed_sessions = pushed_sessions + (tonumber(response and response.sessions) or 0)
                 end
 
-                pushed_sessions = pushed_sessions + (tonumber(response and response.sessions) or 0)
+                if rejected then break end
 
                 if not watermark or watermark <= since then break end
                 self:setSetting("last_session_start", watermark)
