@@ -18,10 +18,13 @@ keeps working.
 | **Status** | Reading, on hold or finished, from KOReader's book status |
 | **Rating and review** | The 1–5 stars and the note you set in KOReader |
 
-Nothing is sent until you pair, and nothing is read from your device beyond
-`statistics.sqlite3` and the per-book sidecar files KOReader already keeps.
+Nothing is sent until you pair. The only things read are `statistics.sqlite3`
+and the per-book sidecar files KOReader already keeps — both through KOReader's
+own APIs, which means opening a sidecar can prune an invalid one, the same as
+browsing your library does.
 
-Sync is one-way: Storylines never writes back to your e-reader.
+Nothing is ever written back to your books or your reading position: sync is
+one-way, from the device to Storylines.
 
 ## Install
 
@@ -30,7 +33,7 @@ works from the older App Store plugin.
 
 **By hand** — download `storylines.koplugin.zip` from
 [Releases](https://github.com/joekw/storylines.koplugin/releases), unzip it, and copy the
-folder into KOReader's plugin directory:
+`storylines.koplugin` folder into KOReader's plugin directory:
 
 | Device | Path |
 |---|---|

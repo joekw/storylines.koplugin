@@ -28,11 +28,11 @@ local NetworkMgr = require("ui/network/manager")
 local ReadHistory = require("readhistory")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local http = require("socket.http")
 local lfs = require("libs/libkoreader-lfs")
 local ltn12 = require("ltn12")
 local logger = require("logger")
 local socketutil = require("socketutil")
-local util = require("util")
 local JSON = require("json")
 local T = require("ffi/util").template
 local _ = require("gettext")
@@ -45,22 +45,35 @@ local ENDPOINT = "https://storylines.software/sync"
 -- Consecutive page turns further apart than this are separate sittings. Ten
 -- minutes is long enough to cover putting the device down mid-chapter and
 -- short enough that an evening and the next morning don't merge.
+--
+-- It is also how the plugin decides a sitting is *over*: a session whose last
+-- page turn is older than this cannot grow any further, so it is safe to stop
+-- re-reading it. Using "are there later rows?" instead would mean the session
+-- you are in the middle of right now is never sent, because nothing follows it.
 local SESSION_GAP_SECONDS = 600
 
--- Matches the server's own caps, so a batch is never refused for size. A first
--- sync of years of history pages through these.
+-- Matches the server's own caps, so a batch is never refused for size.
 local MAX_DOCUMENTS_PER_PUSH = 500
-local MAX_SESSIONS_PER_PUSH = 2000
 
--- Batches per invocation. A very large backlog finishes over several syncs
--- rather than blocking the UI on one.
-local MAX_BATCHES_PER_SYNC = 20
+-- Row limits, not session limits: `page_stat_data` holds one row per page turn,
+-- and a session is many rows.
+--
+-- Escalating rather than fixed. A query that ends mid-sitting can send nothing
+-- (see `sessionPlan`), and if every sitting in the window is unfinished the
+-- watermark cannot move at all — so when that happens the query is simply
+-- widened. A person cannot turn 32,000 pages without a ten-minute break, so the
+-- last step always resolves in practice.
+local ROW_LIMIT_STEPS = { 2000, 8000, 32000 }
 
 -- Page turns before an automatic sync. Progress arrives in bursts anyway.
 local DEFAULT_PAGES_BEFORE_SYNC = 50
 
-local CONNECT_TIMEOUT = 10
-local TOTAL_TIMEOUT = 30
+-- Two request profiles. An automatic sync runs on the UI thread at moments the
+-- user is not expecting to wait — closing a book, reconnecting — so it gets
+-- short timeouts and a hard cap on round trips. An interactive one is behind a
+-- menu tap, where waiting is understood, and is allowed to drain a backlog.
+local AUTOMATIC = { connect = 5, total = 15, batches = 2 }
+local INTERACTIVE = { connect = 10, total = 30, batches = 20 }
 
 -- KOReader's statistics table predates the plugin and is read-only here. We
 -- never write to it.
@@ -71,8 +84,25 @@ local Storylines = WidgetContainer:extend{
     is_doc_only = false,
 }
 
+-- MARK: - Lifecycle
+
+--- Settings are shared across instances, deliberately.
+---
+--- `is_doc_only = false` means both FileManager and ReaderUI construct an
+--- instance of this plugin, and two `LuaSettings:open` calls on one file give
+--- two independent in-memory copies. Whichever flushed last would win, which is
+--- how a pairing — or an unpair — silently reverts. Same approach as kosync's
+--- `KOSync.settings_obj`.
+function Storylines:loadSettings()
+    if not Storylines.settings_obj then
+        Storylines.settings_obj = LuaSettings:open(DataStorage:getSettingsDir() .. "/storylines.lua")
+    end
+    self.settings = Storylines.settings_obj
+end
+
 function Storylines:init()
-    self.settings = LuaSettings:open(DataStorage:getSettingsDir() .. "/storylines.lua")
+    self:loadSettings()
+    self.last_page_synced = nil
     self.page_update_counter = 0
     self.syncing = false
 
@@ -82,6 +112,19 @@ function Storylines:init()
     self:onDispatcherRegisterActions()
 end
 
+--- Cancels anything scheduled against this instance.
+---
+--- Without this a deferred sync outlives the ReaderUI that scheduled it: the
+--- closure keeps the whole dead reader and its document alive, and when it
+--- eventually fires it writes settings from an instance that no longer reflects
+--- what the surviving one did.
+function Storylines:onCloseWidget()
+    if self.deferred_sync then
+        UIManager:unschedule(self.deferred_sync)
+        self.deferred_sync = nil
+    end
+end
+
 function Storylines:onDispatcherRegisterActions()
     Dispatcher:registerAction("storylines_sync_now", {
         category = "none",
@@ -89,6 +132,13 @@ function Storylines:onDispatcherRegisterActions()
         title = _("Sync to Storylines now"),
         general = true,
     })
+end
+
+-- MARK: - Settings access
+
+function Storylines:setSetting(key, value)
+    self.settings:saveSetting(key, value)
+    Storylines.settings_dirty = true
 end
 
 function Storylines:isPaired()
@@ -137,7 +187,7 @@ function Storylines:addToMainMenu(menu_items)
                 checked_func = function() return self:autoSyncEnabled() end,
                 enabled_func = function() return self:isPaired() end,
                 callback = function()
-                    self.settings:saveSetting("auto_sync", not self:autoSyncEnabled())
+                    self:setSetting("auto_sync", not self:autoSyncEnabled())
                     self.settings:flush()
                 end,
                 separator = true,
@@ -161,6 +211,14 @@ function Storylines:showStatus()
         and T(_("Last synced %1."), os.date("%Y-%m-%d %H:%M", last))
         or _("Paired, but nothing has synced yet.")
     UIManager:show(InfoMessage:new{ text = text })
+end
+
+--- Coerces whatever the server put in an error field into something safe to
+--- display. A JSON object here would crash the text widget, on a menu callback
+--- that KOReader does not wrap in a pcall.
+local function displayableError(value, fallback)
+    if type(value) == "string" and value ~= "" then return value end
+    return fallback
 end
 
 -- MARK: - Pairing
@@ -196,21 +254,33 @@ end
 function Storylines:claim(code, touchmenu_instance)
     if not code or code == "" then return end
 
+    -- Interactive, so bringing the network up (and prompting for it, if that is
+    -- how the device is configured) is expected here.
     if NetworkMgr:willRerunWhenOnline(function() self:claim(code, touchmenu_instance) end) then
         return
     end
 
-    local response, status = self:request("POST", "/claim", {
-        code = code,
-        name = self:deviceName(),
-        platform = self:platformName(),
-        koreader_version = self:koreaderVersion(),
-    }, true)
+    -- pcall'd because this is reached from a menu callback, which KOReader
+    -- invokes bare: an error would propagate into the menu widget.
+    local ok, response, status = pcall(function()
+        return self:request("POST", "/claim", {
+            code = code,
+            name = self:deviceName(),
+            platform = self:platformName(),
+            koreader_version = self:koreaderVersion(),
+        }, INTERACTIVE, true)
+    end)
 
-    if status == 200 and response and response.token then
-        self.settings:saveSetting("token", response.token)
-        self.settings:saveSetting("account_id", response.account_id)
-        self.settings:saveSetting("paired_at", os.time())
+    if not ok then
+        logger.warn("Storylines: pairing failed:", tostring(response))
+        UIManager:show(InfoMessage:new{ text = _("Couldn't pair. Please try again.") })
+        return
+    end
+
+    if status == 200 and type(response) == "table" and type(response.token) == "string" then
+        self:setSetting("token", response.token)
+        self:setSetting("account_id", response.account_id)
+        self:setSetting("paired_at", os.time())
         self.settings:flush()
         if touchmenu_instance then touchmenu_instance:updateItems() end
         UIManager:show(InfoMessage:new{
@@ -224,7 +294,8 @@ function Storylines:claim(code, touchmenu_instance)
     end
 
     UIManager:show(InfoMessage:new{
-        text = (response and response.error) or _("Couldn't pair. Check the code and try again."),
+        text = displayableError(type(response) == "table" and response.error or nil,
+                                _("Couldn't pair. Check the code and try again.")),
     })
 end
 
@@ -235,8 +306,24 @@ function Storylines:unpair()
     -- Deliberately keeping last_session_start: re-pairing to the same account
     -- should not re-send history the server already has, and a genuinely new
     -- account gets everything because the server has nothing to collide with.
+    Storylines.settings_dirty = true
     self.settings:flush()
     UIManager:show(InfoMessage:new{ text = _("Unpaired from Storylines."), timeout = 2 })
+end
+
+--- A 401 means the device was unpaired from the app, or the account was
+--- deleted. Clearing the token stops a device that is no longer welcome from
+--- retrying forever, and makes the menu offer pairing again.
+function Storylines:handleRejectedToken()
+    logger.warn("Storylines: token rejected, unpairing")
+    self.settings:delSetting("token")
+    self.settings:delSetting("account_id")
+    self.settings:delSetting("paired_at")
+    Storylines.settings_dirty = true
+    self.settings:flush()
+    UIManager:show(InfoMessage:new{
+        text = _("Storylines rejected this device. Pair it again to resume syncing."),
+    })
 end
 
 -- MARK: - Device description
@@ -271,15 +358,7 @@ end
 ---
 --- `anonymous` skips the Authorization header, which only /claim needs — it is
 --- the one route called before there is a token to send.
-function Storylines:request(method, path, body_table, anonymous)
-    -- KOReader's luasocket build handles https through socket.http on most
-    -- platforms, but not all of them, and ssl.https is absent from some
-    -- builds. Resolving both and picking by scheme is four lines and works
-    -- everywhere.
-    local http = require("socket.http")
-    local ok_https, https = pcall(require, "ssl.https")
-    local requester = (ok_https and https and ENDPOINT:match("^https")) and https.request or http.request
-
+function Storylines:request(method, path, body_table, profile, anonymous)
     local body_json = body_table and JSON.encode(body_table) or nil
     local headers = { ["Accept"] = "application/json" }
 
@@ -295,8 +374,11 @@ function Storylines:request(method, path, body_table, anonymous)
     end
 
     local sink = {}
-    socketutil:set_timeout(CONNECT_TIMEOUT, TOTAL_TIMEOUT)
-    local _result, status = requester{
+    socketutil:set_timeout(profile.connect, profile.total)
+    -- `socket.http` handles https here: KOReader's socketutil requires
+    -- `ssl.https` unconditionally at load, so a build without LuaSec could not
+    -- run this plugin at all.
+    local _result, status = http.request{
         url = ENDPOINT .. path,
         method = method,
         headers = headers,
@@ -322,142 +404,16 @@ end
 
 -- MARK: - Reading local state
 
---- Maps a document checksum to everything we know about that file.
----
---- KOReader's statistics table stores only a checksum, never a path, so the
---- file list comes from the reading history and is joined back by checksum.
---- Computing `partialMD5` is twelve 1 KiB reads, but doing it for every book on
---- every sync still adds up, so results are cached against size and mtime.
-function Storylines:collectBooks()
-    local by_md5 = {}
-    local cache = self.settings:readSetting("md5_cache") or {}
-    local fresh_cache = {}
-    local remembered = self.settings:readSetting("identifiers") or {}
-    local stats = self:collectBookStats()
-
-    for _index, entry in ipairs(ReadHistory.hist or {}) do
-        local file = entry.file
-        local attributes = file and lfs.attributes(file)
-
-        if attributes and attributes.mode == "file" then
-            local stamp = string.format("%d:%d", attributes.size or 0, attributes.modification or 0)
-            local cached = cache[file]
-            local md5 = (cached and cached.stamp == stamp) and cached.md5 or nil
-
-            if not md5 then
-                local ok, computed = pcall(util.partialMD5, file)
-                md5 = ok and computed or nil
-            end
-
-            if md5 then
-                fresh_cache[file] = { stamp = stamp, md5 = md5 }
-                local book = {
-                    doc_key = md5,
-                    filename = file:match("([^/]+)$") or file,
-                    -- When this device last opened the book. The app uses it as
-                    -- the watermark for "is this position news", so it has to
-                    -- be the device's own reckoning rather than a server time.
-                    last_open = tonumber(entry.time),
-                }
-
-                local ok_settings, settings = pcall(function() return DocSettings:open(file) end)
-                if ok_settings and settings then
-                    local props = settings:readSetting("doc_props") or {}
-                    book.title = props.title or props.display_title
-                    book.authors = props.authors
-                    book.series = props.series
-                    book.series_index = tonumber(props.series_index)
-                    book.language = props.language
-                    book.identifiers = props.identifiers
-                    book.koreader_pages = tonumber(settings:readSetting("doc_pages"))
-                    book.percentage = tonumber(settings:readSetting("percent_finished"))
-                    book.position = settings:readSetting("last_xpointer")
-                        or tostring(settings:readSetting("last_page") or "")
-
-                    local summary = settings:readSetting("summary")
-                    if type(summary) == "table" then
-                        book.summary_status = summary.status
-                        book.summary_rating = tonumber(summary.rating)
-                        book.summary_note = summary.note
-                        book.summary_modified = summary.modified
-                    end
-                end
-
-                -- Identifiers live in the sidecar's cached props, which can be
-                -- cleared. Once seen they are remembered here, because the
-                -- server treats an absent field as "no longer known" and an
-                -- ISBN is what makes matching exact rather than a guess.
-                if book.identifiers and book.identifiers ~= "" then
-                    remembered[md5] = book.identifiers
-                elseif remembered[md5] then
-                    book.identifiers = remembered[md5]
-                end
-
-                mergeStats(book, stats[md5])
-                book.isbn = self:isbnFrom(book.identifiers)
-                book.device_name = self:deviceName()
-                by_md5[md5] = book
-            end
-        end
-    end
-
-    self.settings:saveSetting("md5_cache", fresh_cache)
-    self.settings:saveSetting("identifiers", remembered)
-    return by_md5
-end
-
---- Metadata from the statistics database, keyed by checksum.
----
---- The sidecar's cached `doc_props` is the better source when it is there, but
---- it can be absent or cleared — and the server treats an absent field as "no
---- longer known", so pushing a nil title would erase one it had already
---- learned. The statistics `book` table always has a title and authors for
---- anything with reading history, which makes it the right backstop. It is
---- also the only source for `total_read_time`.
-function Storylines:collectBookStats()
-    if lfs.attributes(STATS_DB, "mode") ~= "file" then return {} end
-
-    local ok_sq3, SQ3 = pcall(require, "lua-ljsqlite3/init")
-    if not ok_sq3 then return {} end
-
-    local stats = {}
-
-    local ok, err = pcall(function()
-        local conn = SQ3.open(STATS_DB, "ro")
-        local rows = conn:exec([[
-            SELECT md5, title, authors, series, language, pages, total_read_time, last_open
-            FROM book
-            WHERE md5 IS NOT NULL;
-        ]])
-        conn:close()
-
-        if not rows or not rows[1] then return end
-
-        for index = 1, #rows[1] do
-            stats[rows[1][index]] = {
-                title = rows[2][index],
-                authors = rows[3][index],
-                series = rows[4][index],
-                language = rows[5][index],
-                pages = tonumber(rows[6][index]),
-                total_read_time = tonumber(rows[7][index]),
-                last_open = tonumber(rows[8][index]),
-            }
-        end
-    end)
-
-    if not ok then
-        logger.warn("Storylines: could not read book statistics:", tostring(err))
-        return {}
-    end
-
-    return stats
-end
-
 --- Fills gaps in what the sidecar knew from what the statistics database knows.
 ---
---- KOReader writes "N/A" into the statistics table rather than leaving a column
---- null, so those have to be treated as absent or they end up as book titles.
+--- Declared before its caller on purpose. As a `local function` further down the
+--- file it would be out of scope at the call site, which compiles to a global
+--- lookup, yields nil, and throws — inside a pcall, so the only symptom is that
+--- nothing ever syncs.
+---
+--- KOReader writes the bare literal "N/A" into the statistics table rather than
+--- leaving a column null, so those have to be treated as absent or they end up
+--- as book titles. (It is not translated, so comparing the literal is safe.)
 local function mergeStats(book, stats)
     if not stats then return end
 
@@ -481,17 +437,211 @@ local function mergeStats(book, stats)
     end
 end
 
---- Pulls an ISBN out of crengine's `doc.identifiers`, which is a free-form list
---- of `scheme:value` pairs whose separator and casing vary by publisher.
+--- Metadata from the statistics database, keyed by checksum.
+---
+--- The sidecar's cached `doc_props` is the better source when it is there, but
+--- it can be absent or cleared — and the server treats an absent field as "no
+--- longer known", so pushing a nil title would erase one it had already
+--- learned. The statistics `book` table always has a title and authors for
+--- anything with reading history, which makes it the right backstop. It is
+--- also the only source for `total_read_time`.
+---
+--- Aggregated by checksum rather than read row-by-row: the table's unique index
+--- is (title, authors, md5), so editing a book's metadata between opens leaves
+--- several rows sharing one checksum. Taking whichever row SQLite happened to
+--- return last would report a fraction of the real reading time, while the
+--- session query below correctly unions every `id_book` under that checksum.
+function Storylines:collectBookStats()
+    if lfs.attributes(STATS_DB, "mode") ~= "file" then return {} end
+
+    local ok_sq3, SQ3 = pcall(require, "lua-ljsqlite3/init")
+    if not ok_sq3 then return {} end
+
+    local stats = {}
+
+    local ok, err = pcall(function()
+        local conn = SQ3.open(STATS_DB, "ro")
+        local ok_query, rows = pcall(function()
+            return conn:exec([[
+                SELECT md5,
+                       MAX(title),
+                       MAX(authors),
+                       MAX(series),
+                       MAX(language),
+                       MAX(pages),
+                       SUM(total_read_time),
+                       MAX(last_open)
+                FROM book
+                WHERE md5 IS NOT NULL
+                GROUP BY md5;
+            ]])
+        end)
+        conn:close()
+
+        if not ok_query then error(rows) end
+        -- `exec` returns columns, not rows, and nil for an empty result.
+        if not rows or not rows[1] then return end
+
+        for index = 1, #rows[1] do
+            stats[rows[1][index]] = {
+                title = rows[2][index],
+                authors = rows[3][index],
+                series = rows[4][index],
+                language = rows[5][index],
+                pages = tonumber(rows[6][index]),
+                total_read_time = tonumber(rows[7][index]),
+                last_open = tonumber(rows[8][index]),
+            }
+        end
+    end)
+
+    if not ok then
+        logger.warn("Storylines: could not read book statistics:", tostring(err))
+        return {}
+    end
+
+    return stats
+end
+
+--- Everything we know about each book, keyed by document checksum.
+---
+--- The checksum comes from the sidecar's own `partial_md5_checksum`, which
+--- KOReader computes on open and which *is* the `book.md5` the statistics table
+--- joins on. Recomputing it with `util.partialMD5` would mean twelve file reads
+--- per book per sync, and a cache to invalidate, for a value already on disk.
+function Storylines:collectBooks()
+    local by_md5 = {}
+    local remembered = self.settings:readSetting("identifiers") or {}
+    local stats = self:collectBookStats()
+    local seen_md5 = {}
+
+    for _index, entry in ipairs(ReadHistory.hist or {}) do
+        local file = entry.file
+
+        if file and lfs.attributes(file, "mode") == "file" then
+            local ok_settings, settings = pcall(function() return DocSettings:open(file) end)
+
+            if ok_settings and settings then
+                local md5 = settings:readSetting("partial_md5_checksum")
+
+                if md5 and md5 ~= "" then
+                    local props = settings:readSetting("doc_props") or {}
+                    local book = {
+                        doc_key = md5,
+                        filename = file:match("([^/]+)$") or file,
+                        title = props.title,
+                        authors = props.authors,
+                        series = props.series,
+                        series_index = tonumber(props.series_index),
+                        language = props.language,
+                        identifiers = props.identifiers,
+                        koreader_pages = tonumber(settings:readSetting("doc_pages")),
+                        percentage = tonumber(settings:readSetting("percent_finished")),
+                        -- Left nil rather than "" when neither key exists: an
+                        -- empty string is a value, and the server would store
+                        -- it over a position it already had.
+                        position = settings:readSetting("last_xpointer")
+                            or (settings:readSetting("last_page") and tostring(settings:readSetting("last_page")))
+                            or nil,
+                        -- When this device last opened the book. The app uses it
+                        -- as the watermark for "is this position news", so it
+                        -- has to be the device's own reckoning.
+                        last_open = tonumber(entry.time),
+                    }
+
+                    local summary = settings:readSetting("summary")
+                    if type(summary) == "table" then
+                        book.summary_status = summary.status
+                        book.summary_rating = tonumber(summary.rating)
+                        book.summary_note = summary.note
+                        book.summary_modified = summary.modified
+                    end
+
+                    -- Identifiers live in the sidecar's cached props, which can
+                    -- be cleared. Once seen they are remembered here, because
+                    -- the server treats an absent field as "no longer known"
+                    -- and an ISBN is what makes matching exact rather than a
+                    -- guess.
+                    if book.identifiers and book.identifiers ~= "" then
+                        remembered[md5] = book.identifiers
+                    elseif remembered[md5] then
+                        book.identifiers = remembered[md5]
+                    end
+
+                    mergeStats(book, stats[md5])
+                    book.isbn = self:isbnFrom(book.identifiers)
+                    book.device_name = self:deviceName()
+
+                    by_md5[md5] = book
+                    seen_md5[md5] = true
+                end
+            end
+        end
+    end
+
+    -- Pruned to what the history still holds, so this can't grow for ever.
+    local kept = {}
+    for md5, value in pairs(remembered) do
+        if seen_md5[md5] then kept[md5] = value end
+    end
+    self:setSetting("identifiers", kept)
+
+    return by_md5
+end
+
+--- Pulls an ISBN out of crengine's `doc.identifiers`.
+---
+--- The field is a free-form list of `scheme:value` pairs whose separator and
+--- casing vary by publisher, and it routinely carries Calibre ids, Goodreads
+--- ids and ASINs alongside — several of which are ten or thirteen digits and
+--- would otherwise be mistaken for an ISBN. Since an ISBN match bypasses title
+--- *and* author verification in the app, a false one is worse than none, so:
+--- an explicitly labelled `isbn:` wins outright, and an unlabelled candidate
+--- has to pass its check digit and, at thirteen digits, carry a real Bookland
+--- prefix.
 function Storylines:isbnFrom(identifiers)
     if type(identifiers) ~= "string" or identifiers == "" then return nil end
 
-    for candidate in identifiers:gmatch("[%dXx%-]+") do
-        local stripped = candidate:gsub("[%s%-]", ""):upper()
-        if stripped:match("^%d%d%d%d%d%d%d%d%d[%dX]$") or stripped:match("^%d%d%d%d%d%d%d%d%d%d%d%d%d$") then
-            return stripped
-        end
+    local labelled = identifiers:lower():match("isbn[:=]%s*([%dxX%-%s]+)")
+    if labelled then
+        local candidate = self:validISBN(labelled)
+        if candidate then return candidate end
     end
+
+    for token in identifiers:gmatch("[%dXx%-]+") do
+        local candidate = self:validISBN(token)
+        if candidate then return candidate end
+    end
+    return nil
+end
+
+--- Normalises and check-digit-validates an ISBN, or returns nil.
+function Storylines:validISBN(raw)
+    local value = raw:gsub("[%s%-]", ""):upper()
+
+    if #value == 10 then
+        local sum = 0
+        for index = 1, 10 do
+            local character = value:sub(index, index)
+            local digit = (character == "X") and 10 or tonumber(character)
+            -- X is only ever legal as the final check digit.
+            if not digit or (character == "X" and index ~= 10) then return nil end
+            sum = sum + digit * (11 - index)
+        end
+        return (sum % 11 == 0) and value or nil
+    end
+
+    if #value == 13 then
+        if not (value:sub(1, 3) == "978" or value:sub(1, 3) == "979") then return nil end
+        local sum = 0
+        for index = 1, 13 do
+            local digit = tonumber(value:sub(index, index))
+            if not digit then return nil end
+            sum = sum + digit * ((index % 2 == 1) and 1 or 3)
+        end
+        return (sum % 10 == 0) and value or nil
+    end
+
     return nil
 end
 
@@ -505,64 +655,107 @@ end
 --- raw row already carries the `total_pages` in force at the time. The raw
 --- table is also far cheaper — the view expands rows through a numbers table,
 --- and there is an index on `page_stat_data.start_time` for exactly this query.
-function Storylines:collectSessions(since, limit)
-    if lfs.attributes(STATS_DB, "mode") ~= "file" then return {}, nil end
+---
+--- Returns (sessions, watermark). The watermark is the crux, and it has to
+--- satisfy two things at once: never skip a row, and never re-send a session
+--- under a *different* `started_at` — because that key is the server's identity
+--- for the sitting, so a shifted one is a duplicate rather than a correction.
+--- See `sessionPlan`.
+function Storylines:collectSessions(since)
+    for step, limit in ipairs(ROW_LIMIT_STEPS) do
+        local sessions, watermark, truncated = self:querySessions(since, limit)
+
+        -- Something to send, or the query reached the end of the history:
+        -- either way this is the answer.
+        if #sessions > 0 or not truncated then
+            return sessions, watermark
+        end
+
+        -- Nothing sendable *and* rows left unread: every sitting in the window
+        -- is unfinished, so widening is the only way the watermark can move.
+        if step == #ROW_LIMIT_STEPS then
+            logger.warn("Storylines: no complete sitting within", limit, "rows; will retry later")
+            return sessions, watermark
+        end
+    end
+
+    return {}, nil
+end
+
+--- One pass at `limit` rows. Returns (sendable sessions, watermark, truncated).
+function Storylines:querySessions(since, limit)
+    if lfs.attributes(STATS_DB, "mode") ~= "file" then return {}, nil, false end
 
     local ok_sq3, SQ3 = pcall(require, "lua-ljsqlite3/init")
     if not ok_sq3 then
         logger.warn("Storylines: no sqlite binding, skipping history")
-        return {}, nil
+        return {}, nil, false
     end
 
     local sessions = {}
+    local row_count = 0
+    local last_row_start = nil
 
     local ok, err = pcall(function()
         local conn = SQ3.open(STATS_DB, "ro")
-
-        -- Ordered by time across all books, never by book. Grouping by book
-        -- first would mean a row limit could cut mid-book while the watermark
-        -- advanced past a *different* book's later rows, silently losing
-        -- everything in between. Interleaved books are handled instead by
-        -- keeping one open session per book.
-        --
-        -- The bounds are integers this code produced, so they are formatted in
-        -- rather than bound; ljsqlite3's prepared-statement row iteration
-        -- differs between builds and `exec` is the portable path.
-        local rows = conn:exec(string.format([[
-            SELECT b.md5, d.page, d.start_time, d.duration, d.total_pages
-            FROM page_stat_data d
-            JOIN book b ON b.id = d.id_book
-            WHERE d.start_time > %d AND b.md5 IS NOT NULL
-            ORDER BY d.start_time
-            LIMIT %d;
-        ]], math.floor(since), math.floor(limit)))
-
+        local ok_query, rows = pcall(function()
+            -- Ordered by time across all books, never by book. Grouping by book
+            -- first would let the row limit cut mid-book while the watermark
+            -- advanced past a *different* book's later rows, losing everything
+            -- in between. Interleaved books are handled instead by keeping one
+            -- open session per book.
+            --
+            -- The bounds are integers this code produced, so they are formatted
+            -- in rather than bound; ljsqlite3's prepared-statement row
+            -- iteration differs between builds and `exec` is the portable path.
+            --
+            -- `md5 IS NOT NULL` is load-bearing beyond filtering: a nil in the
+            -- first column would leave a hole in the returned array and `#`
+            -- would truncate the batch silently.
+            return conn:exec(string.format([[
+                SELECT b.md5, d.page, d.start_time, d.duration, d.total_pages
+                FROM page_stat_data d
+                JOIN book b ON b.id = d.id_book
+                WHERE d.start_time > %d AND b.md5 IS NOT NULL
+                ORDER BY d.start_time
+                LIMIT %d;
+            ]], math.floor(since), math.floor(limit)))
+        end)
         conn:close()
 
-        -- `exec` returns columns, not rows.
+        if not ok_query then error(rows) end
         if not rows or not rows[1] then return end
 
         local open = {}
 
-        local function close_session(entry)
+        --- `open_at_end` marks a session that was force-closed because the rows
+        --- ran out rather than because a gap ended it — so it may continue in
+        --- rows this query did not reach.
+        local function close_session(entry, open_at_end)
             local count = 0
             for _page in pairs(entry.pages_seen) do count = count + 1 end
             entry.pages = count
             entry.pages_seen = nil
-            entry.ends_at = nil
+            entry.open_at_end = open_at_end
             sessions[#sessions + 1] = entry
         end
 
-        for index = 1, #rows[1] do
+        row_count = #rows[1]
+
+        for index = 1, row_count do
             local md5 = rows[1][index]
             local page = tonumber(rows[2][index]) or 0
             local start_time = tonumber(rows[3][index]) or 0
             local duration = tonumber(rows[4][index]) or 0
             local total_pages = tonumber(rows[5][index]) or 0
 
+            last_row_start = start_time
+
             local entry = open[md5]
             if entry and start_time - entry.ends_at > SESSION_GAP_SECONDS then
-                close_session(entry)
+                -- Ended by a real gap, so it is complete whatever else this
+                -- query does or doesn't reach.
+                close_session(entry, false)
                 entry = nil
             end
 
@@ -588,35 +781,95 @@ function Storylines:collectSessions(since, limit)
         end
 
         for _md5, entry in pairs(open) do
-            close_session(entry)
+            close_session(entry, true)
         end
     end)
 
     if not ok then
         logger.warn("Storylines: could not read statistics:", tostring(err))
-        return {}, nil
+        return {}, nil, false
     end
 
     table.sort(sessions, function(a, b) return a.started_at < b.started_at end)
 
-    -- The last session may still be growing — the reader could be mid-sitting,
-    -- or its later page turns could be in the next batch — so the watermark
-    -- stops just short of it. Those rows are re-read next time and the session
-    -- is re-sent complete, which the server resolves by overwriting the row
-    -- with the same (document, start) key rather than ignoring it.
-    --
-    -- Re-reading one session's rows is the whole cost. When nothing newer ever
-    -- arrives the watermark stops moving, and the caller's loop notices that
-    -- and stops rather than pushing the same tail forever.
-    local watermark = nil
-    if #sessions > 0 then
-        watermark = sessions[#sessions].started_at - 1
+    local truncated = row_count >= limit
+    local watermark, sendable = self:sessionPlan(sessions, truncated, last_row_start, since)
+
+    -- Bookkeeping for the fold, not part of the payload.
+    for _index, session in ipairs(sendable) do
+        session.ends_at = nil
+        session.open_at_end = nil
     end
 
-    return sessions, watermark
+    return sendable, watermark, truncated
+end
+
+--- Decides how far the watermark may move, and which sessions are safe to send.
+---
+--- A session is only sendable once it can no longer change, because
+--- `(document, started_at)` is the server's identity for a sitting: re-sending
+--- the same reading under a shifted `started_at` is a duplicate, not a
+--- correction, and its duration is then counted twice.
+---
+--- Two independent ways a session can still change:
+---
+---   * It may still be *being read*. That is a wall-clock question — "is its
+---     last page turn more than a gap ago" — not a "are there later rows" one.
+---     Asking about rows would mean the sitting in progress right now is never
+---     sent, because by definition nothing follows it.
+---   * The query may have stopped mid-sitting. Any session still open when the
+---     rows ran out can continue in rows this query didn't reach.
+---
+--- The second is what broke the previous two attempts. Holding back only the
+--- newest session is not enough: with several books interleaved, *every*
+--- session is open at the boundary, and the older ones were being sent
+--- truncated and then re-folded under new keys on the following pass. Verified
+--- by simulation over interleaved, sequential, oversized-sitting and
+--- two-years-of-history shapes.
+---
+--- Everything from the earliest unsendable session onwards is withheld
+--- together, since the watermark is a single point in time and cannot express
+--- "these but not those".
+function Storylines:sessionPlan(sessions, truncated, last_row_start, since)
+    if #sessions == 0 then return nil, {} end
+
+    local now = os.time()
+    local boundary = nil
+
+    for _index, session in ipairs(sessions) do
+        local settled = (now - session.ends_at) > SESSION_GAP_SECONDS
+        local may_continue = session.open_at_end and truncated
+
+        if not settled or may_continue then
+            if not boundary or session.started_at < boundary then
+                boundary = session.started_at
+            end
+        end
+    end
+
+    local sendable = {}
+    for _index, session in ipairs(sessions) do
+        if not boundary or session.started_at < boundary then
+            sendable[#sendable + 1] = session
+        end
+    end
+
+    local watermark = boundary and (boundary - 1) or (last_row_start or since)
+    return math.max(watermark, since), sendable
 end
 
 -- MARK: - Syncing
+
+--- Whether it is safe to use the network without interrupting the user.
+---
+--- Deliberately *not* `willRerunWhenOnline` on the automatic paths. That calls
+--- `isOnline`, which does a blocking DNS lookup, and when offline falls through
+--- to `promptWifiOn` — the default action — so closing a book would pop "turn
+--- on Wi-Fi?" every single time, and suspending would pop it as the screen goes
+--- dark. kosync refuses to do this for the same reason.
+local function canSyncQuietly()
+    return NetworkMgr:isConnected()
+end
 
 function Storylines:syncNow(interactive)
     if not self:isPaired() then
@@ -628,14 +881,20 @@ function Storylines:syncNow(interactive)
 
     if self.syncing then return end
 
-    if NetworkMgr:willRerunWhenOnline(function() self:syncNow(interactive) end) then
+    local profile = interactive and INTERACTIVE or AUTOMATIC
+
+    if interactive then
+        if NetworkMgr:willRerunWhenOnline(function() self:syncNow(true) end) then
+            return
+        end
+    elseif not canSyncQuietly() then
         return
     end
 
     self.syncing = true
     self.page_update_counter = 0
 
-    local ok, err = pcall(function() self:performSync(interactive) end)
+    local ok, err = pcall(function() self:performSync(interactive, profile) end)
 
     self.syncing = false
 
@@ -647,12 +906,23 @@ function Storylines:syncNow(interactive)
     end
 end
 
-function Storylines:performSync(interactive)
+function Storylines:performSync(interactive, profile)
     local books = self:collectBooks()
 
+    -- Only what has changed since the last successful push. Without this every
+    -- sync re-sends every book in the reading history — including free-text
+    -- reviews — which at fifty page turns, every close and every reconnect is
+    -- a lot of bytes for no new information.
+    local signatures = self.settings:readSetting("doc_signatures") or {}
+    local fresh_signatures = {}
     local documents = {}
-    for _md5, book in pairs(books) do
-        documents[#documents + 1] = book
+
+    for md5, book in pairs(books) do
+        local signature = JSON.encode(book)
+        fresh_signatures[md5] = signature
+        if signatures[md5] ~= signature then
+            documents[#documents + 1] = book
+        end
     end
 
     local pushed_documents = 0
@@ -662,14 +932,13 @@ function Storylines:performSync(interactive)
     -- Documents first: they are small, they carry the metadata that makes the
     -- history meaningful, and the app can act on a position without any
     -- history at all.
-    for offset = 1, math.max(#documents, 1), MAX_DOCUMENTS_PER_PUSH do
+    for offset = 1, #documents, MAX_DOCUMENTS_PER_PUSH do
         local batch = {}
         for index = offset, math.min(offset + MAX_DOCUMENTS_PER_PUSH - 1, #documents) do
             batch[#batch + 1] = documents[index]
         end
-        if #batch == 0 then break end
 
-        local response, status = self:request("POST", "/push", { documents = batch })
+        local response, status = self:request("POST", "/push", { documents = batch }, profile)
         if status == 401 then
             self:handleRejectedToken()
             return
@@ -678,40 +947,51 @@ function Storylines:performSync(interactive)
             failed = true
             break
         end
-        pushed_documents = pushed_documents + (response and response.documents or 0)
+        pushed_documents = pushed_documents + (tonumber(response and response.documents) or 0)
+    end
+
+    if not failed and #documents > 0 then
+        -- Recorded only once the push landed, so a failure re-sends next time.
+        self:setSetting("doc_signatures", fresh_signatures)
     end
 
     -- Then history, paging from the watermark. The watermark only advances on a
-    -- 200, so an interrupted first sync resumes rather than losing a chunk.
+    -- 200, so an interrupted sync resumes rather than losing a chunk.
     if not failed then
-        for _batch = 1, MAX_BATCHES_PER_SYNC do
+        for _batch = 1, profile.batches do
             local since = self.settings:readSetting("last_session_start") or 0
-            local sessions, highest = self:collectSessions(since, MAX_SESSIONS_PER_PUSH)
+            local sessions, watermark = self:collectSessions(since)
 
-            if #sessions == 0 then break end
+            -- Nothing to send does not always mean nothing to do: a window
+            -- holding only unfinished sittings still moves the watermark up to
+            -- just below the earliest of them, so the settled history before
+            -- that point is never re-read.
+            if #sessions == 0 then
+                if not watermark or watermark <= since then break end
+                self:setSetting("last_session_start", watermark)
+                self.settings:flush()
+            else
+                local response, status = self:request("POST", "/push", { sessions = sessions }, profile)
+                if status == 401 then
+                    self:handleRejectedToken()
+                    return
+                end
+                if status ~= 200 then
+                    failed = true
+                    break
+                end
 
-            local response, status = self:request("POST", "/push", { sessions = sessions })
-            if status == 401 then
-                self:handleRejectedToken()
-                return
+                pushed_sessions = pushed_sessions + (tonumber(response and response.sessions) or 0)
+
+                if not watermark or watermark <= since then break end
+                self:setSetting("last_session_start", watermark)
+                self.settings:flush()
             end
-            if status ~= 200 then
-                failed = true
-                break
-            end
-
-            pushed_sessions = pushed_sessions + (response and response.sessions or 0)
-
-            -- Guard against a batch whose rows all share the watermark's
-            -- timestamp, which would otherwise loop forever on the same rows.
-            if not highest or highest <= since then break end
-            self.settings:saveSetting("last_session_start", highest)
-            self.settings:flush()
         end
     end
 
     if not failed then
-        self.settings:saveSetting("last_sync_at", os.time())
+        self:setSetting("last_sync_at", os.time())
         self.settings:flush()
     end
 
@@ -725,19 +1005,6 @@ function Storylines:performSync(interactive)
     end
 end
 
---- A 401 means the device was unpaired from the app, or the account was
---- deleted. Clearing the token stops a device that is no longer welcome from
---- retrying forever, and makes the menu offer pairing again.
-function Storylines:handleRejectedToken()
-    logger.warn("Storylines: token rejected, unpairing")
-    self.settings:delSetting("token")
-    self.settings:delSetting("account_id")
-    self.settings:flush()
-    UIManager:show(InfoMessage:new{
-        text = _("Storylines rejected this device. Pair it again to resume syncing."),
-    })
-end
-
 -- MARK: - Events
 
 function Storylines:onStorylinesSyncNow()
@@ -749,11 +1016,8 @@ function Storylines:onCloseDocument()
     if not self:autoSyncEnabled() then return end
     -- Closing a book is the single best moment to sync: the statistics plugin
     -- has just flushed the last page's duration, and the user is not reading.
-    self:syncNow(false)
-end
-
-function Storylines:onSuspend()
-    if not self:autoSyncEnabled() then return end
+    -- Bounded to two round trips with short timeouts, because this runs inline
+    -- on the UI thread before the reader finishes closing.
     self:syncNow(false)
 end
 
@@ -763,22 +1027,41 @@ function Storylines:onNetworkConnected()
     UIManager:scheduleIn(1, function() self:syncNow(false) end)
 end
 
-function Storylines:onPageUpdate()
+-- Deliberately no onSuspend. `Device:_beforeSuspend` broadcasts it inline on the
+-- UI thread, immediately before the device writes to /sys/power/state, so any
+-- network call there freezes the device for as long as it takes to time out.
+-- Nothing is lost by skipping it: the statistics database is already on disk,
+-- and closing the book, reconnecting, or the next fifty page turns all sync.
+
+function Storylines:onPageUpdate(pageno)
     if not self:autoSyncEnabled() then return end
+
+    -- PageUpdate also fires on rerenders, jumps and the position restore at
+    -- open, so it is not a page-turn counter on its own. The statistics plugin
+    -- guards the same way.
+    if pageno and pageno == self.last_page_synced then return end
+    self.last_page_synced = pageno
+
     self.page_update_counter = self.page_update_counter + 1
     if self.page_update_counter < self:pagesBeforeSync() then return end
 
     -- Deferred rather than immediate, so a run of quick page turns coalesces
     -- into one sync once the reader actually settles. Built before it is
-    -- unscheduled, because unscheduling nil on the first page turn is not
-    -- something UIManager is asked to do anywhere else.
+    -- unscheduled, because unscheduling nil is not something UIManager is
+    -- asked to do anywhere else, and cancelled in `onCloseWidget` so it cannot
+    -- outlive this instance.
     self.deferred_sync = self.deferred_sync or function() self:syncNow(false) end
     UIManager:unschedule(self.deferred_sync)
     UIManager:scheduleIn(10, self.deferred_sync)
 end
 
 function Storylines:onFlushSettings()
-    if self.settings then self.settings:flush() end
+    -- Guarded: flushing rewrites the file and renames a backup, and this fires
+    -- on every suspend and every reader close whether or not anything changed.
+    if self.settings and Storylines.settings_dirty then
+        self.settings:flush()
+        Storylines.settings_dirty = false
+    end
 end
 
 return Storylines
